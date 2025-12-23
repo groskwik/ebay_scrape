@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import csv
 import re
 from pathlib import Path
@@ -9,11 +10,11 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
+from selenium.common.exceptions import StaleElementReferenceException
 
 
 AWAITING_URL = "https://www.ebay.com/sh/ord/?filter=status:AWAITING_SHIPMENT"
-#AWAITING_URL = "https://www.ebay.com/sh/ord/?filter=status:ALL_ORDERS" 
+ALL_ORDERS_URL = "https://www.ebay.com/sh/ord/?filter=status:ALL_ORDERS"
 
 RE_ORDER_FULL = re.compile(r"^\d{2}-\d{5}-\d{5}$")   # e.g. 27-13984-70927
 RE_AVAILABLE = re.compile(r"\((\d+)\s+available\)", re.IGNORECASE)
@@ -100,7 +101,7 @@ def safe_find_text(root, by, sel) -> str:
         return ""
 
 
-def scrape_awaiting(driver, timeout=30, max_items=500, debug=False):
+def scrape_orders(driver, timeout=30, max_items=500, debug=False):
     wait = WebDriverWait(driver, timeout)
     wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
@@ -152,7 +153,8 @@ def scrape_awaiting(driver, timeout=30, max_items=500, debug=False):
             # quantity sold & available
             qty_sold = None
             qty_avail = None
-            avail_text = ""
+            price_text = ""
+
             try:
                 avail_span = row.find_element(By.XPATH, ".//span[contains(@class,'available-quantity')]")
                 avail_text = (avail_span.text or "").strip()
@@ -194,7 +196,7 @@ def scrape_awaiting(driver, timeout=30, max_items=500, debug=False):
     return rows
 
 
-def print_table(rows, max_widths=None):
+def print_table(rows, headers=None, max_widths=None):
     """
     Simple aligned table printer.
     """
@@ -202,15 +204,14 @@ def print_table(rows, max_widths=None):
         print("(no rows)")
         return
 
-    headers = list(rows[0].keys())
+    if headers is None:
+        headers = list(rows[0].keys())
 
-    # Compute widths
     widths = {h: len(h) for h in headers}
     for r in rows:
         for h in headers:
             widths[h] = max(widths[h], len(str(r.get(h, ""))))
 
-    # Optional cap widths
     if max_widths:
         for h, cap in max_widths.items():
             if h in widths:
@@ -243,34 +244,62 @@ def write_csv(rows, path: Path):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--all-orders", action="store_true",
+                    help="Scrape ALL_ORDERS instead of AWAITING_SHIPMENT (default).")
+    ap.add_argument("--headless", action="store_true",
+                    help="Run without showing Chrome. Use only after you have a valid logged-in profile.")
+    ap.add_argument("--stdout-short", action="store_true",
+                    help="Print only item_id,title,item_url to stdout (CSV remains full).")
+    ap.add_argument("--max-items", type=int, default=500)
+    ap.add_argument("--timeout", type=int, default=30)
+    ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--out-dir", default=".", help="Output folder for CSV.")
+    args = ap.parse_args()
+
+    url = ALL_ORDERS_URL if args.all_orders else AWAITING_URL
+    out_dir = Path(args.out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Change CSV filename based on mode
+    csv_name = "all_orders_items.csv" if args.all_orders else "awaiting_shipment_items.csv"
+    out_csv = out_dir / csv_name
+
     options = webdriver.ChromeOptions()
 
-    # Dedicated profile folder so you remain logged in between runs
+    # Dedicated profile folder so you remain logged in between runs (KEEP THIS)
     profile_dir = Path(__file__).with_name("chrome_profile_selenium").resolve()
     profile_dir.mkdir(parents=True, exist_ok=True)
     options.add_argument(f"--user-data-dir={str(profile_dir)}")
 
+    # headless (optional)
+    if args.headless:
+        options.add_argument("--headless=new")
+        options.add_argument("--window-size=1400,900")
+
     driver = webdriver.Chrome(options=options)
 
     try:
-        driver.get(AWAITING_URL)
+        driver.get(url)
         ensure_logged_in_or_pause(driver)
-        driver.get(AWAITING_URL)
 
-        rows = scrape_awaiting(driver, timeout=30, max_items=500, debug=True)
+        # Reload after login (same pattern as your working script)
+        driver.get(url)
 
-        # Print a readable console table (cap long columns)
+        rows = scrape_orders(driver, timeout=args.timeout, max_items=args.max_items, debug=args.debug)
+
         print()
-        print_table(rows, max_widths={
-            "title": 60,
-            "item_url": 60,
-        })
+        if args.stdout_short:
+            short_headers = ["item_id", "title", "item_url"]
+            print_table(rows, headers=short_headers, max_widths={"title": 80, "item_url": 80})
+        else:
+            print_table(rows, max_widths={"title": 60, "item_url": 60})
 
-        out = Path("awaiting_shipment_items.csv").resolve()
-        write_csv(rows, out)
-        print(f"\nSaved CSV: {out}")
+        write_csv(rows, out_csv)
+        print(f"\nSaved CSV: {out_csv}")
 
-        input("\nDone. Press Enter to quit...")
+        if not args.headless:
+            input("\nDone. Press Enter to quit...")
 
     finally:
         driver.quit()
@@ -278,4 +307,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
