@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 from __future__ import annotations
 
 import argparse
@@ -153,7 +155,6 @@ def scrape_orders(driver, timeout=30, max_items=500, debug=False):
             # quantity sold & available
             qty_sold = None
             qty_avail = None
-            price_text = ""
 
             try:
                 avail_span = row.find_element(By.XPATH, ".//span[contains(@class,'available-quantity')]")
@@ -196,10 +197,38 @@ def scrape_orders(driver, timeout=30, max_items=500, debug=False):
     return rows
 
 
+def filter_out_phantom_rows(rows):
+    """
+    Drop spurious /itm/ anchors that are not real order items.
+    Typical signature: title is empty AND order fields empty
+    (often also price/qty empty).
+    Keep rows even if order_* is blank, as long as title exists.
+    """
+    out = []
+    for r in rows:
+        title = (r.get("title") or "").strip()
+        order_full = (r.get("order_full") or "").strip()
+        order_number = (r.get("order_number") or "").strip()
+        price_text = (r.get("price_text") or "").strip()
+        qty_sold = (r.get("qty_sold") or "").strip()
+        qty_avail = (r.get("qty_available") or "").strip()
+
+        # Drop only if it looks like a phantom line:
+        # no title AND no order AND no other useful signals
+        if (not title) and (not order_full) and (not order_number) and (not price_text) and (not qty_sold) and (not qty_avail):
+            continue
+
+        # In practice, title empty is the main red flag.
+        # If title is empty AND no order, drop it.
+        if (not title) and (not order_full) and (not order_number):
+            continue
+
+        out.append(r)
+
+    return out
+
+
 def print_table(rows, headers=None, max_widths=None):
-    """
-    Simple aligned table printer.
-    """
     if not rows:
         print("(no rows)")
         return
@@ -261,18 +290,15 @@ def main():
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Change CSV filename based on mode
     csv_name = "all_orders_items.csv" if args.all_orders else "awaiting_shipment_items.csv"
     out_csv = out_dir / csv_name
 
     options = webdriver.ChromeOptions()
 
-    # Dedicated profile folder so you remain logged in between runs (KEEP THIS)
     profile_dir = Path(__file__).with_name("chrome_profile_selenium").resolve()
     profile_dir.mkdir(parents=True, exist_ok=True)
     options.add_argument(f"--user-data-dir={str(profile_dir)}")
 
-    # headless (optional)
     if args.headless:
         options.add_argument("--headless=new")
         options.add_argument("--window-size=1400,900")
@@ -282,11 +308,12 @@ def main():
     try:
         driver.get(url)
         ensure_logged_in_or_pause(driver)
-
-        # Reload after login (same pattern as your working script)
         driver.get(url)
 
         rows = scrape_orders(driver, timeout=args.timeout, max_items=args.max_items, debug=args.debug)
+
+        # NEW: filter out the spurious empty-order rows
+        rows = filter_out_phantom_rows(rows)
 
         print()
         if args.stdout_short:
