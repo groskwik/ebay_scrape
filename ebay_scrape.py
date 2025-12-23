@@ -13,7 +13,7 @@ from selenium.common.exceptions import TimeoutException, StaleElementReferenceEx
 
 
 AWAITING_URL = "https://www.ebay.com/sh/ord/?filter=status:AWAITING_SHIPMENT"
-AWAITING_URL = "https://www.ebay.com/sh/ord/?filter=status:ALL_ORDERS" 
+#AWAITING_URL = "https://www.ebay.com/sh/ord/?filter=status:ALL_ORDERS" 
 
 RE_ORDER_FULL = re.compile(r"^\d{2}-\d{5}-\d{5}$")   # e.g. 27-13984-70927
 RE_AVAILABLE = re.compile(r"\((\d+)\s+available\)", re.IGNORECASE)
