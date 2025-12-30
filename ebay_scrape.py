@@ -1,10 +1,13 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 from __future__ import annotations
 
 import argparse
 import csv
 import re
+import sys
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -21,6 +24,15 @@ ALL_ORDERS_URL = "https://www.ebay.com/sh/ord/?filter=status:ALL_ORDERS"
 RE_ORDER_FULL = re.compile(r"^\d{2}-\d{5}-\d{5}$")   # e.g. 27-13984-70927
 RE_AVAILABLE = re.compile(r"\((\d+)\s+available\)", re.IGNORECASE)
 RE_PRICE = re.compile(r"\$?\s*([0-9]+(?:\.[0-9]{2})?)")
+
+# Title filter (default: only keep items whose title contains "manual", case-insensitive)
+RE_MANUAL = re.compile(r"\b(manual|guide|handbook)\b", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class AccountSpec:
+    name: str
+    profile_dir: Path
 
 
 def ensure_logged_in_or_pause(driver):
@@ -136,7 +148,10 @@ def scrape_orders(driver, timeout=30, max_items=500, debug=False):
             # order number anchor
             order_full = ""
             try:
-                order_el = row.find_element(By.XPATH, ".//a[contains(@href,'/mesh/ord/details') and contains(normalize-space(.),'-')]")
+                order_el = row.find_element(
+                    By.XPATH,
+                    ".//a[contains(@href,'/mesh/ord/details') and contains(normalize-space(.),'-')]"
+                )
                 cand = (order_el.text or "").strip()
                 if RE_ORDER_FULL.match(cand):
                     order_full = cand
@@ -165,7 +180,10 @@ def scrape_orders(driver, timeout=30, max_items=500, debug=False):
                 try:
                     strong_el = avail_span.find_element(By.XPATH, "./preceding-sibling::strong[1]")
                 except Exception:
-                    strong_el = row.find_element(By.XPATH, ".//span[contains(@class,'available-quantity')]/preceding::strong[1]")
+                    strong_el = row.find_element(
+                        By.XPATH,
+                        ".//span[contains(@class,'available-quantity')]/preceding::strong[1]"
+                    )
 
                 s = (strong_el.text or "").strip()
                 qty_sold = int(s) if s.isdigit() else None
@@ -213,18 +231,25 @@ def filter_out_phantom_rows(rows):
         qty_sold = (r.get("qty_sold") or "").strip()
         qty_avail = (r.get("qty_available") or "").strip()
 
-        # Drop only if it looks like a phantom line:
-        # no title AND no order AND no other useful signals
         if (not title) and (not order_full) and (not order_number) and (not price_text) and (not qty_sold) and (not qty_avail):
             continue
 
-        # In practice, title empty is the main red flag.
-        # If title is empty AND no order, drop it.
         if (not title) and (not order_full) and (not order_number):
             continue
 
         out.append(r)
 
+    return out
+
+
+def filter_rows_by_manual(rows, enabled=True):
+    if not enabled:
+        return rows
+    out = []
+    for r in rows:
+        title = (r.get("title") or "").strip()
+        if RE_MANUAL.search(title):
+            out.append(r)
     return out
 
 
@@ -271,66 +296,172 @@ def write_csv(rows, path: Path):
         w.writeheader()
         w.writerows(rows)
 
+
+def build_driver(profile_dir: Path, headless: bool, chrome_binary: str | None = None):
+    options = webdriver.ChromeOptions()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    options.add_argument(f"--user-data-dir={str(profile_dir)}")
+
+    if chrome_binary:
+        options.binary_location = chrome_binary
+
+    if headless:
+        options.add_argument("--headless=new")
+        options.add_argument("--window-size=1400,900")
+
+    return webdriver.Chrome(options=options)
+
+
+def scrape_account(account: AccountSpec, url: str, args) -> list[dict]:
+    driver = build_driver(account.profile_dir, headless=args.headless, chrome_binary=args.chrome_binary)
+    try:
+        if args.debug:
+            print(f"\n=== Account: {account.name} | Profile: {account.profile_dir} ===")
+
+        driver.get(url)
+        ensure_logged_in_or_pause(driver)
+        driver.get(url)
+
+        rows = scrape_orders(driver, timeout=args.timeout, max_items=args.max_items, debug=args.debug)
+        rows = filter_out_phantom_rows(rows)
+
+        # Add account column for downstream scripts / traceability
+        for r in rows:
+            r["account"] = account.name
+
+        # Keep only manuals (default)
+        rows = filter_rows_by_manual(rows, enabled=not args.no_manual_filter)
+
+        return rows
+    finally:
+        driver.quit()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--all-orders", action="store_true",
                     help="Scrape ALL_ORDERS instead of AWAITING_SHIPMENT (default).")
+
+    # Headless behavior unchanged (explicit flag)
     ap.add_argument("--headless", action="store_true",
                     help="Run without showing Chrome. Use only after you have a valid logged-in profile.")
+
     ap.add_argument("--stdout-short", action="store_true",
-                    help="Print only item_id,title,item_url to stdout (CSV remains full).")
+                    help="Print only item_id,title to stdout (CSV remains full).")
+
     ap.add_argument("--max-items", type=int, default=500)
     ap.add_argument("--timeout", type=int, default=30)
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--out-dir", default=".", help="Output folder for CSV.")
+
+    # NEW: multi-account control
+    ap.add_argument("--account", choices=["primary", "secondary", "both"], default="both",
+                    help="Which eBay account(s) to scrape (profiles are separate). Default: both.")
+
+    # NEW: override profile directories if you want
+    ap.add_argument("--primary-profile", default=None,
+                    help="Folder for the primary Chrome user-data-dir (default: ./chrome_profile_selenium).")
+    ap.add_argument("--secondary-profile", default=None,
+                    help="Folder for the secondary Chrome user-data-dir (default: ./chrome_profile_selenium_2).")
+
+    # NEW: allow specifying Chrome binary if needed (optional)
+    ap.add_argument("--chrome-binary", default=None,
+                    help="Optional path to Chrome/Chromium binary.")
+
+    # NEW: manual-only filter (default ON; this disables it)
+    ap.add_argument("--no-manual-filter", action="store_true",
+                    help="Disable the default filter that keeps only items with 'manual' in the title.")
+
     args = ap.parse_args()
 
     url = ALL_ORDERS_URL if args.all_orders else AWAITING_URL
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    csv_name = "all_orders_items.csv" if args.all_orders else "awaiting_shipment_items.csv"
+    script_dir = Path(__file__).resolve().parent
+
+    primary_profile = Path(args.primary_profile).resolve() if args.primary_profile else (script_dir / "chrome_profile_selenium")
+    secondary_profile = Path(args.secondary_profile).resolve() if args.secondary_profile else (script_dir / "chrome_profile_selenium_2")
+
+    accounts = [
+        AccountSpec("PerfectManual", primary_profile),
+        AccountSpec("TitanCalc", secondary_profile),
+    ]
+
+    if args.account == "primary":
+        accounts = [accounts[0]]
+    elif args.account == "secondary":
+        accounts = [accounts[1]]
+    else:
+        pass  # both
+
+    combined_rows: list[dict] = []
+    for acc in accounts:
+        rows = scrape_account(acc, url, args)
+        combined_rows.extend(rows)
+
+    # stable column order for CSV output
+    # (ensure "account" is present and near the front)
+    if combined_rows:
+        # ensure every row has the same keys
+        base_keys = list(combined_rows[0].keys())
+        for r in combined_rows:
+            for k in base_keys:
+                r.setdefault(k, "")
+            for k in list(r.keys()):
+                if k not in base_keys:
+                    base_keys.append(k)
+
+        # Prefer a clean order
+        preferred = [
+            "account",
+            "order_number",
+            "order_full",
+            "item_id",
+            "title",
+            "item_url",
+            "qty_sold",
+            "qty_available",
+            "price",
+            "price_text",
+        ]
+        # Append any unknown keys at end
+        headers = [h for h in preferred if h in base_keys] + [h for h in base_keys if h not in preferred]
+    else:
+        headers = ["account", "order_number", "order_full", "item_id", "title", "item_url", "qty_sold", "qty_available", "price", "price_text"]
+
+    # Output CSV name reflects filter + which page
+    page_tag = "all_orders" if args.all_orders else "awaiting_shipment"
+    manual_tag = "manuals" if not args.no_manual_filter else "all_items"
+    csv_name = f"{page_tag}_{manual_tag}.csv" if args.account == "both" else f"{page_tag}_{manual_tag}_{args.account}.csv"
     out_csv = out_dir / csv_name
 
-    options = webdriver.ChromeOptions()
+    # Console output
+    print()
+    if args.stdout_short:
+        short_headers = ["account", "item_id", "title"]
+        print_table(combined_rows, headers=short_headers, max_widths={"title": 90})
+    else:
+        print_table(combined_rows, headers=headers, max_widths={"title": 60, "item_url": 60, "price_text": 40})
 
-    profile_dir = Path(__file__).with_name("chrome_profile_selenium").resolve()
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    options.add_argument(f"--user-data-dir={str(profile_dir)}")
+    # Write CSV
+    if combined_rows:
+        with out_csv.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=headers)
+            w.writeheader()
+            w.writerows(combined_rows)
 
-    if args.headless:
-        options.add_argument("--headless=new")
-        options.add_argument("--window-size=1400,900")
+    print(f"\nSaved CSV: {out_csv}")
+    print(f"Rows kept: {len(combined_rows)}")
+    #if not args.no_manual_filter:
+    #    print("Filter applied: title contains 'manual' (case-insensitive).")
+    #else:
+    #    print("Filter disabled: keeping all titles.")
 
-    driver = webdriver.Chrome(options=options)
-
-    try:
-        driver.get(url)
-        ensure_logged_in_or_pause(driver)
-        driver.get(url)
-
-        rows = scrape_orders(driver, timeout=args.timeout, max_items=args.max_items, debug=args.debug)
-
-        # NEW: filter out the spurious empty-order rows
-        rows = filter_out_phantom_rows(rows)
-
-        print()
-        if args.stdout_short:
-            #short_headers = ["item_id", "title", "item_url"]
-            short_headers = ["item_id", "title"]
-            print_table(rows, headers=short_headers, max_widths={"title": 80, "item_url": 80})
-        else:
-            print_table(rows, max_widths={"title": 60, "item_url": 60})
-
-        write_csv(rows, out_csv)
-        print(f"\nSaved CSV: {out_csv}")
-
-        if not args.headless:
-            input("\nDone. Press Enter to quit...")
-
-    finally:
-        driver.quit()
+    # NOTE: unlike your earlier version, we do not pause at the end,
+    # because we may have scraped multiple accounts and always quit drivers.
 
 
 if __name__ == "__main__":
     main()
+
