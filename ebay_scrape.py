@@ -432,7 +432,7 @@ def main():
 
     # Output CSV name reflects filter + which page
     page_tag = "all_orders" if args.all_orders else "awaiting_shipment"
-    manual_tag = "manuals" if not args.no_manual_filter else "all_items"
+    manual_tag = "items" if not args.no_manual_filter else "all_items"
     csv_name = f"{page_tag}_{manual_tag}.csv" if args.account == "both" else f"{page_tag}_{manual_tag}_{args.account}.csv"
     out_csv = out_dir / csv_name
 
